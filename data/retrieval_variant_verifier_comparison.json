@@ -1,0 +1,26 @@
+[
+  {
+    "file": "retrieved_dev_top10.jsonl",
+    "records": 19998,
+    "accuracy": 0.5405040504050405,
+    "macro_f1": 0.5407612324607903
+  },
+  {
+    "file": "retrieved_dev_hybrid_top10.jsonl",
+    "records": 19998,
+    "accuracy": 0.5446044604460446,
+    "macro_f1": 0.5450516522269037
+  },
+  {
+    "file": "retrieved_dev_hybrid_first_semantic_fill_top10.jsonl",
+    "records": 19998,
+    "accuracy": 0.5446044604460446,
+    "macro_f1": 0.5450516522269037
+  },
+  {
+    "file": "retrieved_dev_hybrid_first_semantic_append_top20.jsonl",
+    "records": 19998,
+    "accuracy": 0.545054505450545,
+    "macro_f1": 0.5460188064838037
+  }
+]
