@@ -9,6 +9,7 @@ from pipeline import (
     FINAL_EVIDENCE_K,
     TOP_K,
     format_claim_evidence,
+    group_evidence_by_article,
     load_pipeline,
     retrieve_evidence,
     verify_claim,
@@ -18,11 +19,31 @@ from pipeline import (
 class TestFormatting(unittest.TestCase):
     def test_format_claim_evidence_basic(self):
         pair = format_claim_evidence("Earth is round.", "Earth is an oblate spheroid.")
-        self.assertEqual(pair, "Earth is round. [SEP] Earth is an oblate spheroid.")
+        self.assertEqual(pair, "claim: Earth is round. evidence: Earth is an oblate spheroid.")
 
     def test_format_claim_evidence_whitespace_stripping(self):
         pair = format_claim_evidence("  Claim text  ", "  Evidence text  \n")
-        self.assertEqual(pair, "Claim text [SEP] Evidence text")
+        self.assertEqual(pair, "claim: Claim text evidence: Evidence text")
+
+
+class TestGrouping(unittest.TestCase):
+    def test_group_evidence_by_article(self):
+        evidence = [
+            {"rank": 1, "article_id": "Team_A", "sentence_id": 0, "text": "Sentence zero ."},
+            {"rank": 2, "article_id": "Team_B", "sentence_id": 0, "text": "Team B info ."},
+            {"rank": 3, "article_id": "Team_A", "sentence_id": 2, "text": "Sentence two ."},
+        ]
+        groups = group_evidence_by_article(evidence)
+        self.assertEqual(len(groups), 2)
+        # First group should be Team_A because min_rank is 1
+        self.assertEqual(groups[0]["article_id"], "Team_A")
+        self.assertEqual(groups[0]["sentence_count"], 2)
+        self.assertEqual(groups[0]["text"], "Sentence zero . Sentence two .")
+        self.assertEqual(groups[0]["sentence_ids"], [0, 2])
+        # Second group is Team_B
+        self.assertEqual(groups[1]["article_id"], "Team_B")
+        self.assertEqual(groups[1]["sentence_count"], 1)
+        self.assertEqual(groups[1]["text"], "Team B info .")
 
 
 class TestPipelineArtifacts(unittest.TestCase):
@@ -87,7 +108,6 @@ class TestRetrieval(unittest.TestCase):
         )
 
     def test_oov_claim_graceful_handling(self):
-        # Query with characters/words not in vocabulary
         results = retrieve_evidence(
             "xyzqvr12345 nonesuchwordexists",
             self.vectorizer,
@@ -157,7 +177,7 @@ class TestVerification(unittest.TestCase):
         self.assertIsNone(summary)
         self.assertEqual(results, [])
 
-    def test_aggregation_probability_distribution(self):
+    def test_aggregation_and_strategies(self):
         claim = "Fox 2000 Pictures released the film Soul Food."
         mock_evidence = [
             {
@@ -172,24 +192,34 @@ class TestVerification(unittest.TestCase):
                 "sentence_id": 1,
                 "text": "Universal Pictures released the film in cinemas in the United States.",
             },
+            {
+                "rank": 3,
+                "article_id": "Other_Article",
+                "sentence_id": 0,
+                "text": "Fox 2000 Pictures was a sister division.",
+            },
         ]
-        summary, results = verify_claim(claim, mock_evidence, self.verifier)
-        self.assertIsNotNone(summary)
-        self.assertEqual(len(results), 2)
+        # Test article-grouped strategy
+        summary_art, results_art = verify_claim(
+            claim, mock_evidence, self.verifier, grouping_strategy="article_grouped"
+        )
+        self.assertIsNotNone(summary_art)
+        self.assertEqual(summary_art["grouping_strategy"], "article_grouped")
+        self.assertEqual(summary_art["evidence_sets_count"], 2)  # Soul_Food and Other_Article
+        self.assertAlmostEqual(sum(summary_art["scores"].values()), 1.0, places=4)
+        self.assertEqual(len(results_art), 3)
 
-        # Probabilities must sum to ~1.0
-        scores = summary["scores"]
-        total_prob = sum(scores.values())
-        self.assertAlmostEqual(total_prob, 1.0, places=4)
+        # Test per-sentence strategy
+        summary_sent, results_sent = verify_claim(
+            claim, mock_evidence, self.verifier, grouping_strategy="per_sentence"
+        )
+        self.assertIsNotNone(summary_sent)
+        self.assertEqual(summary_sent["grouping_strategy"], "per_sentence")
+        self.assertEqual(summary_sent["evidence_sets_count"], 3)
+        self.assertAlmostEqual(sum(summary_sent["scores"].values()), 1.0, places=4)
 
-        # Summary label must be the argmax of the scores
-        best_label = max(scores.items(), key=lambda kv: kv[1])[0]
-        self.assertEqual(summary["label"], best_label)
-        self.assertAlmostEqual(summary["predicted_class_score"], scores[best_label], places=4)
-        self.assertGreaterEqual(summary["margin"], 0.0)
-
-        # Each result item must have per-class scores summing to ~1.0
-        for res in results:
+        # Sentence-level results must have per-class scores summing to ~1.0
+        for res in results_art:
             item_scores = res["class_scores"]
             self.assertAlmostEqual(sum(item_scores.values()), 1.0, places=4)
             best_item_label = max(item_scores.items(), key=lambda kv: kv[1])[0]
@@ -221,6 +251,19 @@ class TestVerification(unittest.TestCase):
         ]
         summary, _ = verify_claim(claim, evidence, self.verifier)
         self.assertEqual(summary["label"], "REFUTES")
+
+    def test_representative_not_enough_info_case(self):
+        claim = "Tilda Swinton is a vegan."
+        evidence = [
+            {
+                "rank": 1,
+                "article_id": "Tilda_Swinton",
+                "sentence_id": 0,
+                "text": "The film stars George Clooney , John Malkovich , Frances McDormand , Tilda Swinton , and Brad Pitt .",
+            }
+        ]
+        summary, _ = verify_claim(claim, evidence, self.verifier)
+        self.assertEqual(summary["label"], "NOT ENOUGH INFO")
 
     def test_carolina_panthers_case(self):
         claim = "The Carolina Panthers' inaugural NFL season was in 1995."

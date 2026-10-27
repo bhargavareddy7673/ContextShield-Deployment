@@ -14,6 +14,7 @@ from pipeline import (
     RRF_K,
     TOP_K,
     format_claim_evidence,
+    group_evidence_by_article,
     load_pipeline as _load_pipeline_raw,
     retrieve_evidence,
     verify_claim,
@@ -50,7 +51,8 @@ def main():
 
     # Scientific integrity notice
     st.info(
-        "ℹ️ **Evaluation & Calibration Notice**: Model scores are **uncalibrated outputs** "
+        "ℹ️ **Evaluation & Calibration Notice**: Model inputs are structured in the verified training format "
+        "(`claim: {claim} evidence: {evidence_text}`). Scores are **uncalibrated outputs** "
         "produced by a linear Logistic Regression classifier over TF-IDF word and character features. "
         "They are **not calibrated probabilities** that a claim is true in the real world. "
         "Retrieval scores reflect textual and semantic similarity to the local corpus, not factual validity."
@@ -61,6 +63,7 @@ def main():
         st.header("⚙️ System Architecture")
         st.markdown(
             """
+            - **Input Format**: `claim: {claim} evidence: {evidence_text}`
             - **Retrieval**: Hybrid (Word TF-IDF + all-MiniLM-L6-v2)
             - **Fusion**: Reciprocal Rank Fusion ($k=60$)
             - **Evidence Pool**: Top 10 hybrid + 5 unique semantic
@@ -69,6 +72,22 @@ def main():
             - **Classes**: `SUPPORTS`, `REFUTES`, `NOT ENOUGH INFO`
             """
         )
+
+        st.divider()
+        st.subheader("⚙️ Verification Strategy")
+        strategy_option = st.radio(
+            "Evidence Grouping Strategy:",
+            [
+                "Article-Grouped (Matches Training)",
+                "Per-Sentence",
+            ],
+            index=0,
+            help=(
+                "Article-Grouped clusters sentences from the same article into a unified evidence set, "
+                "mirroring the training construction. Per-Sentence evaluates every retrieved sentence independently."
+            ),
+        )
+        grouping_strategy = "article_grouped" if "Article-Grouped" in strategy_option else "per_sentence"
 
         st.divider()
         st.subheader("📝 Try Sample Claims")
@@ -107,7 +126,7 @@ def main():
                 use_container_width=True,
             )
         with col2:
-            st.caption("Press 'Verify Claim' to retrieve passages and compute the provisional verdict.")
+            st.caption(f"Strategy: **{strategy_option}** · Format: `claim: ... evidence: ...`")
 
     if submitted:
         claim_cleaned = claim.strip()
@@ -143,6 +162,7 @@ def main():
                     claim_cleaned,
                     evidence,
                     verifier,
+                    grouping_strategy=grouping_strategy,
                 )
 
             st.divider()
@@ -157,7 +177,7 @@ def main():
             # Display Analysis Summary
             st.header("Analysis Result")
 
-            col_label, col_margin, col_count = st.columns([2, 1, 1])
+            col_label, col_margin, col_sets, col_count = st.columns([2, 1, 1, 1])
             with col_label:
                 pred_label = summary["label"]
                 if pred_label == "SUPPORTS":
@@ -170,16 +190,20 @@ def main():
             with col_margin:
                 st.metric("Top Class Score", f"{summary['predicted_class_score']:.3f}")
 
+            with col_sets:
+                st.metric("Evidence Sets", f"{summary['evidence_sets_count']}")
+
             with col_count:
-                st.metric("Passages Evaluated", f"{summary['evidence_count']}")
+                st.metric("Sentences Evaluated", f"{summary['evidence_count']}")
 
             st.caption(
-                f"Prediction determined by the highest mean score across {summary['evidence_count']} "
-                f"retrieved passages. Decision margin over second class: {summary['margin']:.3f}."
+                f"Prediction determined by the highest mean score across {summary['evidence_sets_count']} "
+                f"evidence set(s) using **{summary['grouping_strategy']}** grouping. "
+                f"Decision margin over second class: {summary['margin']:.3f}."
             )
 
             # Class Score Distribution
-            st.subheader("Mean Verifier Scores Across Retrieved Evidence")
+            st.subheader("Mean Verifier Scores Across Evidence Sets")
             col_s1, col_s2, col_s3 = st.columns(3)
             score_cols = {
                 "SUPPORTS": col_s1,
@@ -194,9 +218,32 @@ def main():
                     st.markdown(f"### `{val:.3f}`")
                     st.progress(max(0.0, min(1.0, val)))
 
+            # Article-Level Evidence Sets (if article_grouped)
+            if summary.get("article_groups"):
+                st.divider()
+                st.subheader(f"Article Evidence Sets ({len(summary['article_groups'])} sets)")
+                st.caption(
+                    "Sentences sharing the same source article are joined with spaces to form coherent evidence sets, "
+                    "mirroring the training data construction."
+                )
+                for g in summary["article_groups"]:
+                    g_heading = (
+                        f"Article Set {g['rank']} · {g['article_id']} ({g['sentence_count']} sentence(s)) · "
+                        f"Verdict: {g['predicted_label']} ({g['model_score']:.3f})"
+                    )
+                    with st.expander(g_heading, expanded=(g["rank"] <= 2)):
+                        st.markdown(f"> *\"{g['text']}\"*")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.write(f"- Source Article: `{g['article_id']}`")
+                            st.write(f"- Sentences: `{g['sentence_ids']}`")
+                        with c2:
+                            st.write(f"- Group Verdict: **{g['predicted_label']}**")
+                            st.write(f"- Model Score: `{g['model_score']:.3f}`")
+
             # Retrieved Evidence Inspection
             st.divider()
-            st.subheader(f"Retrieved Evidence Passages ({len(evidence_results)} sentences)")
+            st.subheader(f"Retrieved Individual Evidence Passages ({len(evidence_results)} sentences)")
             st.caption(
                 "Evidence is ranked by retrieval similarity (RRF fusion or dense semantic cosine). "
                 "Individual sentence verdicts represent how the verifier evaluates each pair in isolation."
@@ -257,8 +304,8 @@ def main():
             1. **Query Processing**: The input claim is vectorized using word-level TF-IDF and encoded with `all-MiniLM-L6-v2`.
             2. **Hybrid Retrieval**: Top candidates are scored against the 108,559-sentence corpus with both sparse TF-IDF and dense embeddings.
             3. **Reciprocal Rank Fusion**: Both rankings are fused with $k=60$ to yield top hybrid evidence passages, followed by high-similarity semantic candidates up to 15 total sentences.
-            4. **Pairwise Verification**: Each retrieved sentence is paired with the claim (`claim [SEP] evidence`) and classified by the saved 3-class verifier.
-            5. **Aggregation & Display**: Class probabilities are averaged across passages to produce a provisional verdict and per-evidence breakdown.
+            4. **Evidence Grouping & Verification**: Retrieved evidence is formatted using the verified Colab training format (`claim: {claim} evidence: {evidence_text}`). Evidence can be evaluated as coherent article-level sets or individual sentences.
+            5. **Aggregation & Display**: Class probabilities are pooled to produce a provisional verdict, article set breakdowns, and per-evidence sentence inspection.
             """
         )
 

@@ -1,6 +1,7 @@
 """ContextShield pipeline: artifact loading, hybrid retrieval, and claim verification."""
 
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,9 +32,52 @@ def format_claim_evidence(claim: str, evidence_text: str) -> str:
     """Format claim and evidence pair for the saved verifier model.
 
     The saved verifier pipeline (FeatureUnion of word and char TF-IDF + Logistic Regression)
-    was trained with '[SEP]' as the delimiter between claim and individual evidence sentence.
+    was trained using the format:
+        'claim: ' + row['claim'] + ' evidence: ' + row['evidence_text']
+    where evidence_text represents evidence sentences joined with spaces.
     """
-    return f"{claim.strip()} [SEP] {evidence_text.strip()}"
+    return f"claim: {claim.strip()} evidence: {evidence_text.strip()}"
+
+
+def group_evidence_by_article(evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group retrieved evidence passages by article_id.
+
+    In the training data construction, all sentences belonging to a single evidence
+    set were joined with spaces: " ".join(s["text"] for s in sentences).
+    This grouping clusters retrieved sentences by their source article to form
+    coherent evidence candidates, preserving the best retrieval rank per article.
+    """
+    if not evidence:
+        return []
+
+    article_groups: Dict[str, Dict[str, Any]] = {}
+    for item in evidence:
+        art_id = item["article_id"]
+        if art_id not in article_groups:
+            article_groups[art_id] = {
+                "article_id": art_id,
+                "sentence_ids": [item["sentence_id"]],
+                "texts": [item["text"].strip()],
+                "items": [item],
+                "min_rank": item["rank"],
+            }
+        else:
+            article_groups[art_id]["sentence_ids"].append(item["sentence_id"])
+            article_groups[art_id]["texts"].append(item["text"].strip())
+            article_groups[art_id]["items"].append(item)
+
+    sorted_groups = sorted(article_groups.values(), key=lambda g: g["min_rank"])
+    return [
+        {
+            "rank": idx,
+            "article_id": g["article_id"],
+            "sentence_ids": g["sentence_ids"],
+            "text": " ".join(g["texts"]),
+            "sentence_count": len(g["texts"]),
+            "constituent_items": g["items"],
+        }
+        for idx, g in enumerate(sorted_groups, start=1)
+    ]
 
 
 def load_pipeline(data_dir: Optional[Path] = None) -> Tuple[
@@ -268,12 +312,22 @@ def verify_claim(
     claim: str,
     evidence: List[Dict[str, Any]],
     verifier: Any,
+    grouping_strategy: str = "article_grouped",
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Verify a claim against retrieved evidence passages using the saved verifier.
 
+    Args:
+        claim: The factual claim string.
+        evidence: List of retrieved evidence sentence dicts.
+        verifier: Trained scikit-learn verifier pipeline.
+        grouping_strategy: Strategy to construct evidence sets for aggregate verdict:
+            - 'article_grouped' (default): Group sentences by article_id, joining with
+              spaces as in the training evidence sets.
+            - 'per_sentence': Treat each retrieved sentence as an independent evidence candidate.
+
     Returns:
         (summary_dict, evidence_results_list)
-        where summary_dict is None if evidence is empty.
+        where summary_dict is None if claim or evidence is empty.
     """
     if not claim or not claim.strip():
         return None, []
@@ -282,24 +336,17 @@ def verify_claim(
         return None, []
 
     clean_claim = claim.strip()
-    pairs = [
+    classes = np.asarray(verifier.classes_)
+
+    # 1. Evaluate each individual retrieved sentence for detailed inspection
+    sent_pairs = [
         format_claim_evidence(clean_claim, item["text"])
         for item in evidence
     ]
-
-    probabilities = verifier.predict_proba(pairs)
-    classes = np.asarray(verifier.classes_)
-
-    mean_probabilities = probabilities.mean(axis=0)
-    best_index = int(np.argmax(mean_probabilities))
-
-    # Calculate margin between highest and second highest score
-    sorted_probs = np.sort(mean_probabilities)[::-1]
-    margin = float(sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else 1.0
+    sent_probabilities = verifier.predict_proba(sent_pairs)
 
     results: List[Dict[str, Any]] = []
-
-    for item, probs in zip(evidence, probabilities):
+    for item, probs in zip(evidence, sent_probabilities):
         best = int(np.argmax(probs))
         result = dict(item)
         result["predicted_label"] = str(classes[best])
@@ -310,15 +357,52 @@ def verify_claim(
         }
         results.append(result)
 
+    # 2. Form evidence sets according to grouping_strategy for aggregate verdict
+    article_summaries = []
+    if grouping_strategy == "article_grouped":
+        article_groups = group_evidence_by_article(evidence)
+        art_pairs = [
+            format_claim_evidence(clean_claim, g["text"])
+            for g in article_groups
+        ]
+        art_probabilities = verifier.predict_proba(art_pairs)
+        mean_probabilities = art_probabilities.mean(axis=0)
+
+        for g, probs in zip(article_groups, art_probabilities):
+            best = int(np.argmax(probs))
+            article_summaries.append({
+                "rank": g["rank"],
+                "article_id": g["article_id"],
+                "sentence_ids": g["sentence_ids"],
+                "sentence_count": g["sentence_count"],
+                "text": g["text"],
+                "predicted_label": str(classes[best]),
+                "model_score": float(probs[best]),
+                "class_scores": {
+                    str(cls): float(prob) for cls, prob in zip(classes, probs)
+                },
+            })
+    else:  # per_sentence
+        mean_probabilities = sent_probabilities.mean(axis=0)
+
+    best_index = int(np.argmax(mean_probabilities))
+
+    # Calculate margin between highest and second highest score
+    sorted_probs = np.sort(mean_probabilities)[::-1]
+    margin = float(sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else 1.0
+
     summary = {
         "label": str(classes[best_index]),
         "predicted_class_score": float(mean_probabilities[best_index]),
         "margin": margin,
         "evidence_count": len(results),
+        "evidence_sets_count": len(article_summaries) if article_summaries else len(results),
+        "grouping_strategy": grouping_strategy,
         "scores": {
             str(label): float(prob)
             for label, prob in zip(classes, mean_probabilities)
         },
+        "article_groups": article_summaries,
     }
 
     return summary, results
