@@ -51,25 +51,29 @@ def group_evidence_by_article(evidence: List[Dict[str, Any]]) -> List[Dict[str, 
         return []
 
     article_groups: Dict[str, Dict[str, Any]] = {}
-    for item in evidence:
+    for idx, item in enumerate(evidence, start=1):
         art_id = item["article_id"]
+        rnk = item.get("rank", idx)
         if art_id not in article_groups:
             article_groups[art_id] = {
                 "article_id": art_id,
                 "sentence_ids": [item["sentence_id"]],
                 "texts": [item["text"].strip()],
                 "items": [item],
-                "min_rank": item["rank"],
+                "min_rank": rnk,
             }
         else:
             article_groups[art_id]["sentence_ids"].append(item["sentence_id"])
             article_groups[art_id]["texts"].append(item["text"].strip())
             article_groups[art_id]["items"].append(item)
+            if rnk < article_groups[art_id]["min_rank"]:
+                article_groups[art_id]["min_rank"] = rnk
 
     sorted_groups = sorted(article_groups.values(), key=lambda g: g["min_rank"])
     return [
         {
             "rank": idx,
+            "min_rank": g["min_rank"],
             "article_id": g["article_id"],
             "sentence_ids": g["sentence_ids"],
             "text": " ".join(g["texts"]),
@@ -313,6 +317,7 @@ def verify_claim(
     evidence: List[Dict[str, Any]],
     verifier: Any,
     grouping_strategy: str = "article_grouped",
+    aggregation_method: str = "relevance_weighted",
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Verify a claim against retrieved evidence passages using the saved verifier.
 
@@ -324,6 +329,11 @@ def verify_claim(
             - 'article_grouped' (default): Group sentences by article_id, joining with
               spaces as in the training evidence sets.
             - 'per_sentence': Treat each retrieved sentence as an independent evidence candidate.
+        aggregation_method: Probability pooling method across evidence sets:
+            - 'relevance_weighted' (default): Weight each evidence candidate by its reciprocal
+              retrieval rank (w_k = 1 / rank_k). This prevents irrelevant or uninformative
+              low-ranked background passages from diluting decisive, top-ranked evidence.
+            - 'mean': Uniform unweighted mean pooling across all evidence sets (baseline).
 
     Returns:
         (summary_dict, evidence_results_list)
@@ -345,19 +355,31 @@ def verify_claim(
     ]
     sent_probabilities = verifier.predict_proba(sent_pairs)
 
+    # 2. Compute sentence weights based on aggregation_method
+    if aggregation_method == "relevance_weighted":
+        sent_weights = np.array(
+            [1.0 / max(1, item.get("rank", idx)) for idx, item in enumerate(evidence, start=1)],
+            dtype=float,
+        )
+    else:  # 'mean'
+        sent_weights = np.ones(len(evidence), dtype=float)
+
+    sent_weights_normalized = sent_weights / (sent_weights.sum() if sent_weights.sum() > 0 else 1.0)
+
     results: List[Dict[str, Any]] = []
-    for item, probs in zip(evidence, sent_probabilities):
+    for idx, (item, probs) in enumerate(zip(evidence, sent_probabilities)):
         best = int(np.argmax(probs))
         result = dict(item)
         result["predicted_label"] = str(classes[best])
         result["model_score"] = float(probs[best])
+        result["weight"] = float(sent_weights_normalized[idx])
         result["class_scores"] = {
             str(cls): float(prob)
             for cls, prob in zip(classes, probs)
         }
         results.append(result)
 
-    # 2. Form evidence sets according to grouping_strategy for aggregate verdict
+    # 3. Form evidence sets according to grouping_strategy for aggregate verdict
     article_summaries = []
     if grouping_strategy == "article_grouped":
         article_groups = group_evidence_by_article(evidence)
@@ -366,16 +388,36 @@ def verify_claim(
             for g in article_groups
         ]
         art_probabilities = verifier.predict_proba(art_pairs)
-        mean_probabilities = art_probabilities.mean(axis=0)
 
-        for g, probs in zip(article_groups, art_probabilities):
+        if aggregation_method == "relevance_weighted":
+            art_weights = np.array(
+                [1.0 / max(1, g.get("min_rank", g.get("rank", idx))) for idx, g in enumerate(article_groups, start=1)],
+                dtype=float,
+            )
+            w_sum = art_weights.sum()
+            agg_probabilities = (art_probabilities * art_weights[:, None]).sum(axis=0) / (w_sum if w_sum > 0 else 1.0)
+        else:  # 'mean'
+            art_weights = np.ones(len(article_groups), dtype=float)
+            agg_probabilities = art_probabilities.mean(axis=0)
+
+        art_weights_normalized = art_weights / (art_weights.sum() if art_weights.sum() > 0 else 1.0)
+
+        for idx, (g, probs) in enumerate(zip(article_groups, art_probabilities)):
             best = int(np.argmax(probs))
+            group_sent_ids = set(str(s) for s in g["sentence_ids"])
+            matching_sentences = [
+                r for r in results
+                if str(r["article_id"]) == str(g["article_id"]) and str(r["sentence_id"]) in group_sent_ids
+            ]
             article_summaries.append({
                 "rank": g["rank"],
+                "min_rank": g.get("min_rank", g["rank"]),
                 "article_id": g["article_id"],
                 "sentence_ids": g["sentence_ids"],
                 "sentence_count": g["sentence_count"],
                 "text": g["text"],
+                "constituent_sentences": matching_sentences,
+                "weight": float(art_weights_normalized[idx]),
                 "predicted_label": str(classes[best]),
                 "model_score": float(probs[best]),
                 "class_scores": {
@@ -383,26 +425,190 @@ def verify_claim(
                 },
             })
     else:  # per_sentence
-        mean_probabilities = sent_probabilities.mean(axis=0)
+        if aggregation_method == "relevance_weighted":
+            agg_probabilities = (sent_probabilities * sent_weights[:, None]).sum(axis=0) / sent_weights.sum()
+        else:  # 'mean'
+            agg_probabilities = sent_probabilities.mean(axis=0)
 
-    best_index = int(np.argmax(mean_probabilities))
+    best_index = int(np.argmax(agg_probabilities))
 
     # Calculate margin between highest and second highest score
-    sorted_probs = np.sort(mean_probabilities)[::-1]
+    sorted_probs = np.sort(agg_probabilities)[::-1]
     margin = float(sorted_probs[0] - sorted_probs[1]) if len(sorted_probs) > 1 else 1.0
 
     summary = {
         "label": str(classes[best_index]),
-        "predicted_class_score": float(mean_probabilities[best_index]),
+        "predicted_class_score": float(agg_probabilities[best_index]),
         "margin": margin,
         "evidence_count": len(results),
         "evidence_sets_count": len(article_summaries) if article_summaries else len(results),
         "grouping_strategy": grouping_strategy,
+        "aggregation_method": aggregation_method,
         "scores": {
             str(label): float(prob)
-            for label, prob in zip(classes, mean_probabilities)
+            for label, prob in zip(classes, agg_probabilities)
         },
         "article_groups": article_summaries,
     }
 
     return summary, results
+
+
+def generate_explanation(
+    claim: str,
+    summary: Optional[Dict[str, Any]],
+    evidence_results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Generate an honest, grounded plain-English explanation of the verification verdict.
+
+    Adheres strictly to scientific integrity:
+    1. Cites only actual retrieved passages from evidence_results; never invents facts.
+    2. Transparently explains borderline decisions and classifier limitations.
+    3. Clearly distinguishes between conclusive evidence and insufficient information.
+    4. Refrains from presenting linear classifier scores as real-world probabilities of truth.
+    """
+    if not summary or not evidence_results:
+        return {
+            "verdict": "NOT ENOUGH INFO",
+            "verdict_headline": "No Evidence Retrieved",
+            "explanation_text": (
+                "The system found no relevant evidence passages in the local Wikipedia corpus "
+                "for this claim. ContextShield cannot make a factual determination without evidence."
+            ),
+            "key_passage": None,
+            "certainty_tier": "Insufficient Data",
+            "certainty_description": "No evidence was available to score.",
+            "has_borderline_margin": False,
+        }
+
+    label = summary["label"]
+    score = summary["predicted_class_score"]
+    margin = summary["margin"]
+    scores = summary["scores"]
+    evidence_count = summary.get("evidence_count", len(evidence_results))
+
+    # Identify primary passage: Rank 1 retrieved item
+    top_passage = evidence_results[0] if evidence_results else None
+
+    # Assess decision certainty / margin tier
+    if margin >= 0.25 and score >= 0.50:
+        certainty_tier = "Decisive Alignment"
+        certainty_desc = f"Strong stance separation: {label} leads by a margin of {margin:.3f} over alternative classes."
+        is_borderline = False
+    elif margin >= 0.10:
+        certainty_tier = "Moderate Alignment"
+        certainty_desc = f"Moderate stance separation: {label} leads with a margin of {margin:.3f}."
+        is_borderline = False
+    else:
+        certainty_tier = "Borderline / Narrow Margin"
+        certainty_desc = (
+            f"Narrow decision margin ({margin:.3f}). The classifier scores are close between the top two "
+            "classes, indicating high model sensitivity or mixed evidence."
+        )
+        is_borderline = True
+
+    # Construct grounded explanations based on label and evidence
+    if label == "SUPPORTS":
+        verdict_headline = "Evidence Confirms Claim"
+        sup_passages = [p for p in evidence_results if p.get("predicted_label") == "SUPPORTS"]
+        primary = sup_passages[0] if sup_passages else top_passage
+        art_clean = primary["article_id"].replace("_", " ")
+
+        explanation_text = (
+            f"ContextShield retrieved {evidence_count} evidence sentence(s) from the corpus. "
+            f"The primary supporting evidence from Wikipedia article '{art_clean}' states: "
+            f"\"{primary['text'].strip()}\". "
+            f"The verifier evaluated this passage in the verified training format ('claim: ... evidence: ...') "
+            f"and assigned a consolidated support score of {score:.3f} (margin: {margin:.3f} over other classes)."
+        )
+        art_groups = summary.get("article_groups", [])
+        if art_groups and art_groups[0].get("predicted_label") != label:
+            top_g = art_groups[0]
+            top_name = top_g["article_id"].replace("_", " ")
+            explanation_text += (
+                f" Note on evidence aggregation: Although the multi-sentence passage for '{top_name}' "
+                f"yields a plurality of {top_g['predicted_label']} ({top_g['model_score']:.3f}) due to "
+                f"passage context dilution, its constituent primary sentence directly confirms the claim "
+                f"({primary.get('predicted_label', 'SUPPORTS')} {primary.get('model_score', 0.0):.3f}), and "
+                f"reciprocal-rank probability pooling across all retrieved article sets yields a consolidated {label} verdict."
+            )
+        key_passage = primary
+
+    elif label == "REFUTES":
+        verdict_headline = "Evidence Contradicts Claim"
+        ref_passages = [p for p in evidence_results if p.get("predicted_label") == "REFUTES"]
+        primary = ref_passages[0] if ref_passages else top_passage
+        art_clean = primary["article_id"].replace("_", " ")
+
+        explanation_text = (
+            f"ContextShield retrieved evidence conflicting directly with the claim. "
+            f"The primary contradictory passage from Wikipedia article '{art_clean}' states: "
+            f"\"{primary['text'].strip()}\". "
+            f"The verifier evaluated this conflict and assigned a consolidated refute score of {score:.3f} "
+            f"(margin: {margin:.3f} over other classes)."
+        )
+        art_groups = summary.get("article_groups", [])
+        if art_groups and art_groups[0].get("predicted_label") != label:
+            top_g = art_groups[0]
+            top_name = top_g["article_id"].replace("_", " ")
+            explanation_text += (
+                f" Note on evidence aggregation: Although the multi-sentence passage for '{top_name}' "
+                f"yields a plurality of {top_g['predicted_label']} ({top_g['model_score']:.3f}), "
+                f"its constituent primary sentence directly contradicts the claim "
+                f"({primary.get('predicted_label', 'REFUTES')} {primary.get('model_score', 0.0):.3f}), and "
+                f"reciprocal-rank probability pooling across all retrieved article sets yields a consolidated {label} verdict."
+            )
+        key_passage = primary
+
+    else:  # NOT ENOUGH INFO
+        verdict_headline = "Insufficient Evidence in Corpus"
+        key_passage = top_passage
+        art_clean = top_passage["article_id"].replace("_", " ") if top_passage else "corpus"
+
+        # Check if primary retrieved passage has high relevance despite NOT ENOUGH INFO verdict
+        has_high_relevance = False
+        if top_passage:
+            sem_sc = float(top_passage.get("semantic_score", 0.0))
+            tf_sc = float(top_passage.get("tfidf_score", 0.0))
+            if sem_sc >= 0.70 or (sem_sc >= 0.60 and tf_sc >= 0.35):
+                has_high_relevance = True
+
+        if has_high_relevance:
+            verdict_headline = "Evidence Retrieved but Unconfirmed"
+            explanation_text = (
+                f"ContextShield retrieved a highly relevant evidence passage from Wikipedia article '{art_clean}' "
+                f"(\"{top_passage['text'].strip()}\"), but the classifier assigned an overall verdict of "
+                f"NOT ENOUGH INFO (score: {scores.get('NOT ENOUGH INFO', 0.0):.3f}). "
+                f"Notice: While the retrieved passage directly addresses the claim subject and entities, "
+                f"high retrieval similarity alone does not establish factual verification. The linear TF-IDF "
+                f"classifier may fail to confirm the claim due to phrasing sensitivity, vocabulary differences, "
+                f"or model representation limits. ContextShield transparently flags this potential misclassification "
+                f"rather than asserting false certainty."
+            )
+        elif is_borderline and top_passage and "SUPPORTS" in scores and abs(scores.get("SUPPORTS", 0.0) - scores.get("NOT ENOUGH INFO", 0.0)) < 0.15:
+            explanation_text = (
+                f"ContextShield retrieved relevant background from Wikipedia article '{art_clean}' "
+                f"(\"{top_passage['text'].strip()}\"), but the linear TF-IDF classifier's margin between "
+                f"NOT ENOUGH INFO ({scores.get('NOT ENOUGH INFO', 0.0):.3f}) and alternative classes "
+                f"is narrow ({margin:.3f}). Due to phrasing sensitivity of bag-of-words and character n-grams, "
+                f"the system conservatively abstains from asserting a definitive verdict, correctly reporting "
+                "NOT ENOUGH INFO rather than projecting false certainty."
+            )
+        else:
+            explanation_text = (
+                f"The local corpus contains general information regarding '{art_clean}', but the retrieved "
+                f"passages do not contain verified factual details confirming or disproving this specific assertion. "
+                f"Because the evidence is non-decisive (NOT ENOUGH INFO score: {scores.get('NOT ENOUGH INFO', 0.0):.3f}), "
+                "ContextShield transparently abstains from making an unsupported factual determination."
+            )
+
+    return {
+        "verdict": label,
+        "verdict_headline": verdict_headline,
+        "explanation_text": explanation_text,
+        "key_passage": key_passage,
+        "certainty_tier": certainty_tier,
+        "certainty_description": certainty_desc,
+        "has_borderline_margin": is_borderline,
+        "has_relevance_warning": has_high_relevance if label == "NOT ENOUGH INFO" else False,
+    }
