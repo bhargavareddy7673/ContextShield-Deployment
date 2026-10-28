@@ -1,6 +1,7 @@
 """ContextShield pipeline: artifact loading, hybrid retrieval, and claim verification."""
 
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +16,16 @@ from sentence_transformers import SentenceTransformer
 # --------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+
+HF_REPO_ID = "BHARGAVAREDDY1/contextshield-artifacts"
+
+REQUIRED_ARTIFACT_FILENAMES = [
+    "evidence_verifier_3class.joblib",
+    "retrieval_tfidf_word.joblib",
+    "retrieval_tfidf_matrix.npz",
+    "train_retrieval_corpus.jsonl",
+    "train_corpus_embeddings.npy",
+]
 
 VERIFIER_PATH = DATA_DIR / "evidence_verifier_3class.joblib"
 VECTORIZER_PATH = DATA_DIR / "retrieval_tfidf_word.joblib"
@@ -84,15 +95,89 @@ def group_evidence_by_article(evidence: List[Dict[str, Any]]) -> List[Dict[str, 
     ]
 
 
-def load_pipeline(data_dir: Optional[Path] = None) -> Tuple[
+def check_missing_artifacts(data_dir: Optional[Path] = None) -> List[str]:
+    """Check which required ContextShield artifacts are missing from data_dir."""
+    data = Path(data_dir) if data_dir else DATA_DIR
+    return [fname for fname in REQUIRED_ARTIFACT_FILENAMES if not (data / fname).is_file()]
+
+
+def ensure_artifacts_exist(
+    data_dir: Optional[Path] = None,
+    repo_id: str = HF_REPO_ID,
+    token: Optional[str] = None,
+) -> List[str]:
+    """Ensure all required ContextShield model and corpus artifacts exist locally.
+
+    If any required artifact is missing from data_dir, downloads only the missing
+    files from the Hugging Face repository into data_dir. Preserves exact filenames
+    and directory paths expected by load_pipeline().
+
+    Args:
+        data_dir: Directory where artifacts should reside (defaults to DATA_DIR).
+        repo_id: Hugging Face repository identifier.
+        token: Optional Hugging Face access token (not needed for public repositories).
+
+    Returns:
+        List of filenames that were downloaded (empty if all were already present).
+    """
+    data = Path(data_dir) if data_dir else DATA_DIR
+    data.mkdir(parents=True, exist_ok=True)
+
+    missing = check_missing_artifacts(data)
+    if not missing:
+        return []
+
+    # Use environment token if token not explicitly passed
+    auth_token = token or os.environ.get("HF_TOKEN") or None
+
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=str(data),
+            allow_patterns=missing,
+            token=auth_token,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to download required ContextShield artifacts ({missing}) from "
+            f"Hugging Face repository '{repo_id}': {exc}"
+        ) from exc
+
+    still_missing = check_missing_artifacts(data)
+    if still_missing:
+        raise FileNotFoundError(
+            f"Artifact download completed, but the following files are still missing in '{data}': "
+            + ", ".join(still_missing)
+        )
+
+    return missing
+
+
+def load_pipeline(
+    data_dir: Optional[Path] = None,
+    auto_download: bool = True,
+    repo_id: str = HF_REPO_ID,
+    token: Optional[str] = None,
+) -> Tuple[
     Any, Any, sp.csr_matrix, List[Dict[str, Any]], np.ndarray, SentenceTransformer
 ]:
     """Load all saved model artifacts and verify integrity and alignment.
+
+    Args:
+        data_dir: Directory containing artifacts.
+        auto_download: If True, automatically downloads any missing required artifacts
+            from the Hugging Face repository before loading.
+        repo_id: Hugging Face repository identifier.
+        token: Optional Hugging Face token.
 
     Returns:
         (verifier, vectorizer, matrix, corpus, embeddings, semantic_model)
     """
     data = Path(data_dir) if data_dir else DATA_DIR
+    if auto_download:
+        ensure_artifacts_exist(data, repo_id=repo_id, token=token)
+
     verifier_path = data / "evidence_verifier_3class.joblib"
     vectorizer_path = data / "retrieval_tfidf_word.joblib"
     matrix_path = data / "retrieval_tfidf_matrix.npz"

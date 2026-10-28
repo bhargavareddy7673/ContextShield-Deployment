@@ -1,13 +1,19 @@
 """Unit and integration tests for ContextShield pipeline."""
 
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 import numpy as np
 
 from pipeline import (
     DATA_DIR,
     FINAL_EVIDENCE_K,
+    HF_REPO_ID,
+    REQUIRED_ARTIFACT_FILENAMES,
     TOP_K,
+    check_missing_artifacts,
+    ensure_artifacts_exist,
     format_claim_evidence,
     generate_explanation,
     group_evidence_by_article,
@@ -74,6 +80,66 @@ class TestPipelineArtifacts(unittest.TestCase):
     def test_verifier_classes(self):
         expected_classes = ["NOT ENOUGH INFO", "REFUTES", "SUPPORTS"]
         self.assertEqual(list(self.verifier.classes_), expected_classes)
+
+
+class TestArtifactPresenceAndDownload(unittest.TestCase):
+    def test_check_missing_artifacts_on_local_corpus(self):
+        """Verify that check_missing_artifacts correctly finds no missing files on local DATA_DIR."""
+        missing = check_missing_artifacts(DATA_DIR)
+        self.assertEqual(missing, [])
+
+    def test_check_missing_artifacts_detects_missing(self):
+        """Verify that check_missing_artifacts accurately identifies missing files."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            # Create only 2 dummy files
+            (tmp_path / "evidence_verifier_3class.joblib").write_text("dummy")
+            (tmp_path / "retrieval_tfidf_word.joblib").write_text("dummy")
+
+            missing = check_missing_artifacts(tmp_path)
+            self.assertEqual(len(missing), 3)
+            self.assertIn("retrieval_tfidf_matrix.npz", missing)
+            self.assertIn("train_retrieval_corpus.jsonl", missing)
+            self.assertIn("train_corpus_embeddings.npy", missing)
+
+    def test_ensure_artifacts_exist_already_present_skips_download(self):
+        """Verify that ensure_artifacts_exist returns [] immediately when all files exist."""
+        with patch("huggingface_hub.snapshot_download") as mock_dl:
+            downloaded = ensure_artifacts_exist(DATA_DIR)
+            self.assertEqual(downloaded, [])
+            mock_dl.assert_not_called()
+
+    def test_ensure_artifacts_exist_mocked_download(self):
+        """Verify download invocation without downloading real 235 MB payload."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            def fake_download(*args, **kwargs):
+                local_dir = Path(kwargs["local_dir"])
+                # Simulate downloading all requested patterns
+                for fname in kwargs["allow_patterns"]:
+                    (local_dir / fname).write_text("mocked_artifact_content")
+
+            with patch("huggingface_hub.snapshot_download", side_effect=fake_download) as mock_dl:
+                downloaded = ensure_artifacts_exist(tmp_path)
+                self.assertEqual(set(downloaded), set(REQUIRED_ARTIFACT_FILENAMES))
+                mock_dl.assert_called_once()
+                self.assertEqual(mock_dl.call_args.kwargs["repo_id"], HF_REPO_ID)
+                # Verify files were actually created in tmp_path
+                self.assertEqual(check_missing_artifacts(tmp_path), [])
+
+    def test_ensure_artifacts_exist_network_failure_raises(self):
+        """Verify that download failure raises RuntimeError with clear diagnostic message."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with patch(
+                "huggingface_hub.snapshot_download",
+                side_effect=ConnectionError("Simulated Hugging Face unreachable"),
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_artifacts_exist(tmp_path)
+                self.assertIn("Failed to download required ContextShield artifacts", str(ctx.exception))
+                self.assertIn(HF_REPO_ID, str(ctx.exception))
 
 
 class TestRetrieval(unittest.TestCase):

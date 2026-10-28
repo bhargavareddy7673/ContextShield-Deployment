@@ -11,8 +11,11 @@ from pipeline import (
     BASE_DIR,
     DATA_DIR,
     FINAL_EVIDENCE_K,
+    HF_REPO_ID,
     RRF_K,
     TOP_K,
+    check_missing_artifacts,
+    ensure_artifacts_exist,
     format_claim_evidence,
     generate_explanation,
     group_evidence_by_article,
@@ -27,7 +30,16 @@ from pipeline import (
 @st.cache_resource(show_spinner="Loading ContextShield verifier, corpus, and embeddings...")
 def load_pipeline():
     """Cache loaded model artifacts in Streamlit resource cache."""
-    return _load_pipeline_raw(DATA_DIR)
+    missing = check_missing_artifacts(DATA_DIR)
+    if missing:
+        hf_token = None
+        try:
+            if hasattr(st, "secrets") and "HF_TOKEN" in st.secrets:
+                hf_token = st.secrets["HF_TOKEN"]
+        except Exception:
+            pass
+        ensure_artifacts_exist(DATA_DIR, token=hf_token)
+    return _load_pipeline_raw(DATA_DIR, auto_download=False)
 
 
 # --------------------------------------------------
@@ -58,6 +70,31 @@ def main():
         "over retrieved Wikipedia passages. They are **uncalibrated classifier outputs**, not real-world "
         "probabilities of truth. The system abstains when evidence is insufficient or non-decisive."
     )
+
+    # Ensure verification model and corpus artifacts exist locally on deployment boot
+    missing_artifacts = check_missing_artifacts(DATA_DIR)
+    if missing_artifacts:
+        missing_count = len(missing_artifacts)
+        with st.spinner(
+            f"📥 Downloading {missing_count} missing verification artifact(s) from Hugging Face "
+            f"({', '.join(missing_artifacts)})... This happens once on deployment startup."
+        ):
+            try:
+                hf_token = None
+                try:
+                    if hasattr(st, "secrets") and "HF_TOKEN" in st.secrets:
+                        hf_token = st.secrets["HF_TOKEN"]
+                except Exception:
+                    pass
+                ensure_artifacts_exist(DATA_DIR, token=hf_token)
+                st.success("✅ ContextShield artifacts downloaded and verified successfully!")
+            except Exception as exc:
+                st.error(
+                    f"❌ Error downloading model artifacts from Hugging Face (`{HF_REPO_ID}`):\n\n"
+                    f"```{exc}```\n\n"
+                    "Please ensure the Hugging Face repository is accessible or provide a read token in Streamlit Secrets."
+                )
+                st.stop()
 
     # Sidebar: System configuration and sample queries
     with st.sidebar:
